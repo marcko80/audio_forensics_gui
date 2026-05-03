@@ -1,0 +1,6 @@
+numpy>=1.21
+librosa>=0.9
+soundfile>=0.12
+mutagen>=1.45
+matplotlib>=3.5
+scipy>=1.7
