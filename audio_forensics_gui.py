@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
-║        AUDIO FORENSICS ANALYZER  —  GUI Edition  v3.0                  ║
+║        AUDIO FORENSICS ANALYZER  —  GUI Edition  v4.0                  ║
 ║        Strumento forense per l'analisi di file audio                    ║
 ║        Conforme: ENFSI BPM-FSA-002 / SWGDE 1.2                         ║
 ║        Supporta: WAV · MP3 · OGG · FLAC · AIFF · M4A · OPUS · WMA     ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 
-CHANGELOG v3.0 — vedi CHANGELOG.md
+CHANGELOG v4.0 — vedi CHANGELOG.md
+  Nuovi moduli (alta priorità ENFSI BPM-FSA-002):
+  · Codec frame analysis OGG Vorbis (§5.4.3, ref [33][34][35])
+  · Double-encoding detection MP3/lossy (§5.4.4, ref [69][70])
+  · Inter-sample dependency / resampling detection (§5.4.4, ref [67][68])
+  · Copy-move forgery detection cross-correlazione (§5.4.4, ref [62][63])
 
 Dipendenze (installa con pip):
     pip install librosa soundfile mutagen matplotlib numpy scipy
@@ -64,7 +69,7 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 # COSTANTI
 # ─────────────────────────────────────────────────────────────────────────────
-VERSION       = "3.0.0"
+VERSION       = "4.0.0"
 BPM_REF       = "ENFSI BPM-FSA-002 Issue 000"
 SUPPORTED_EXT = {".wav",".mp3",".ogg",".flac",".aiff",".aif",
                  ".m4a",".wma",".opus",".oga",".mp4",".3gp"}
@@ -548,12 +553,624 @@ def compute_ltas(y, sr, n_bands=24):
         return {"error": str(e)}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ANALISI ANOMALIE (aggiornata v3.0)
+# ▶ NUOVO v4.0 — CODEC FRAME ANALYSIS OGG VORBIS (ENFSI BPM §5.4.3)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def detect_anomalies(y, sr, wf, enf, dc_local, butt, quant):
+def analyze_codec_frames_ogg(filepath):
     """
-    Rileva anomalie forensi integrando tutti i moduli v3.0.
+    Analisi della struttura delle pagine OGG e del framing grid Vorbis.
+    Discontinuità nel framing offset indicano possibile editing.
+    Riferimento: ENFSI BPM-FSA-002 §5.4.3, Gärtner [33], Korycki [34], Yang [35].
+
+    Analisi eseguita:
+    - Parsing raw di tutte le pagine OggS nel file
+    - Verifica monotonica dei granule position (timestamp interno OGG)
+    - Rilevamento salti anomali nella sequenza di granule
+    - Verifica continuità del sequence number per serial stream
+    - Analisi della dimensione delle pagine (anomalie indicano editing)
+    """
+    result = {
+        "applicable":       False,
+        "total_pages":      0,
+        "serial_streams":   [],
+        "granule_jumps":    [],
+        "seq_gaps":         [],
+        "page_size_anomalies": [],
+        "framing_ok":       None,
+        "note":             "",
+    }
+
+    ext = Path(filepath).suffix.lower()
+    if ext not in (".ogg", ".oga", ".opus"):
+        result["note"] = "Non applicabile (formato non OGG)"
+        return result
+
+    result["applicable"] = True
+
+    try:
+        pages = []
+        with open(filepath, "rb") as f:
+            raw = f.read()
+
+        offset = 0
+        while offset < len(raw) - 27:
+            if raw[offset:offset+4] != b"OggS":
+                offset += 1
+                continue
+            if offset + 27 > len(raw):
+                break
+
+            version    = raw[offset+4]
+            header_type= raw[offset+5]
+            # granule position: int64 little-endian (può essere -1 = 0xFFFFFFFFFFFFFFFF)
+            granule_raw= struct.unpack_from("<Q", raw, offset+6)[0]
+            granule    = granule_raw if granule_raw != 0xFFFFFFFFFFFFFFFF else -1
+            serial     = struct.unpack_from("<I", raw, offset+14)[0]
+            seq_num    = struct.unpack_from("<I", raw, offset+18)[0]
+            checksum   = struct.unpack_from("<I", raw, offset+22)[0]
+            seg_count  = raw[offset+26]
+
+            if offset + 27 + seg_count > len(raw):
+                break
+
+            seg_table  = raw[offset+27:offset+27+seg_count]
+            page_data_size = sum(seg_table)
+            page_total = 27 + seg_count + page_data_size
+
+            pages.append({
+                "offset":     offset,
+                "header_type":header_type,
+                "granule":    granule,
+                "serial":     serial,
+                "seq_num":    seq_num,
+                "seg_count":  seg_count,
+                "data_size":  page_data_size,
+                "is_bos":     bool(header_type & 0x02),  # Beginning Of Stream
+                "is_eos":     bool(header_type & 0x04),  # End Of Stream
+                "is_cont":    bool(header_type & 0x01),  # Continuation
+            })
+            offset += page_total
+
+        result["total_pages"] = len(pages)
+        if not pages:
+            result["note"] = "Nessuna pagina OGG trovata"
+            result["framing_ok"] = False
+            return result
+
+        # Raggruppa per serial stream
+        streams = {}
+        for p in pages:
+            s = p["serial"]
+            if s not in streams:
+                streams[s] = []
+            streams[s].append(p)
+        result["serial_streams"] = list(streams.keys())
+
+        granule_jumps = []
+        seq_gaps      = []
+        page_size_anoms = []
+
+        for serial, stream_pages in streams.items():
+            granules = [(p["granule"], p["offset"]) for p in stream_pages if p["granule"] >= 0]
+            seqs     = [(p["seq_num"], p["offset"]) for p in stream_pages]
+            sizes    = [p["data_size"] for p in stream_pages]
+
+            # ── Analisi granule position (deve essere monotonicamente crescente) ──
+            for i in range(1, len(granules)):
+                prev_g, prev_off = granules[i-1]
+                curr_g, curr_off = granules[i]
+                delta = curr_g - prev_g
+                if delta < 0:
+                    granule_jumps.append({
+                        "serial":     serial,
+                        "offset_hex": hex(curr_off),
+                        "prev_granule": prev_g,
+                        "curr_granule": curr_g,
+                        "delta":      delta,
+                        "tipo":       "INVERSIONE",
+                    })
+                elif delta == 0 and i > 1:
+                    granule_jumps.append({
+                        "serial":     serial,
+                        "offset_hex": hex(curr_off),
+                        "prev_granule": prev_g,
+                        "curr_granule": curr_g,
+                        "delta":      delta,
+                        "tipo":       "STALLO",
+                    })
+                elif len(granules) > 4:
+                    # Salto anomalo: delta > 5x mediana degli altri delta
+                    all_deltas = [granules[j][0]-granules[j-1][0]
+                                  for j in range(1, len(granules))
+                                  if granules[j][0]-granules[j-1][0] > 0]
+                    if all_deltas:
+                        median_d = float(np.median(all_deltas))
+                        if median_d > 0 and delta > 5 * median_d:
+                            granule_jumps.append({
+                                "serial":       serial,
+                                "offset_hex":   hex(curr_off),
+                                "prev_granule": prev_g,
+                                "curr_granule": curr_g,
+                                "delta":        delta,
+                                "tipo":         f"SALTO ({delta/median_d:.1f}x mediana)",
+                            })
+
+            # ── Analisi sequence number (deve essere consecutivo) ──
+            for i in range(1, len(seqs)):
+                prev_s, _ = seqs[i-1]
+                curr_s, off = seqs[i]
+                expected = (prev_s + 1) & 0xFFFFFFFF
+                if curr_s != expected:
+                    seq_gaps.append({
+                        "serial":     serial,
+                        "offset_hex": hex(off),
+                        "expected":   expected,
+                        "found":      curr_s,
+                        "gap":        (curr_s - prev_s - 1) & 0xFFFFFFFF,
+                    })
+
+            # ── Anomalie dimensione pagina ──
+            if len(sizes) > 5:
+                arr = np.array(sizes, dtype=float)
+                mean_s = float(np.mean(arr))
+                std_s  = float(np.std(arr))
+                if std_s > 0:
+                    for i, (pg, sz) in enumerate(zip(stream_pages, sizes)):
+                        z = abs(sz - mean_s) / std_s
+                        if z > 4.0 and sz not in (0, 255*255):
+                            page_size_anoms.append({
+                                "serial":     serial,
+                                "offset_hex": hex(pg["offset"]),
+                                "size":       sz,
+                                "mean":       round(mean_s, 1),
+                                "z_score":    round(z, 2),
+                            })
+
+        result["granule_jumps"]       = granule_jumps
+        result["seq_gaps"]            = seq_gaps
+        result["page_size_anomalies"] = page_size_anoms[:10]
+        result["framing_ok"] = (len(granule_jumps) == 0 and len(seq_gaps) == 0)
+
+    except Exception as e:
+        result["note"]       = f"Errore parsing OGG: {e}"
+        result["framing_ok"] = None
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ▶ NUOVO v4.0 — DOUBLE ENCODING DETECTION (ENFSI BPM §5.4.4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detect_double_encoding(y, sr, filepath):
+    """
+    Rilevamento di doppia codifica lossy (es. MP3→MP3, OGG→MP3).
+    Metodo: analisi degli artefatti spettrali tipici della codifica lossy
+    tramite MDCT-like residual e analisi LTAS differenziale.
+    Riferimento: ENFSI BPM-FSA-002 §5.4.4, Bianchi [69], Korycki [71].
+
+    Indicatori analizzati:
+    1. Cut-off frequency anomala (codec lowpass filter lascia traccia)
+    2. Distribuzione energia sub-band: pattern periodici tipici MDCT
+    3. Notches spettrali periodici (firma doppia codifica)
+    4. Analisi varianza spettrale temporale (lossy riduce varianza)
+    """
+    ext = Path(filepath).suffix.lower()
+    result = {
+        "applicable":          True,
+        "cutoff_freq_hz":      None,
+        "cutoff_anomaly":      False,
+        "spectral_notches":    [],
+        "mdct_periodicity":    None,
+        "double_enc_suspected": False,
+        "confidence":          "BASSA",
+        "note":                "",
+    }
+
+    # Solo su file abbastanza lunghi
+    if len(y) / sr < 3.0:
+        result["applicable"] = False
+        result["note"]       = "Durata insufficiente (<3s)"
+        return result
+
+    try:
+        n_fft   = 4096
+        hop     = 1024
+        S       = np.abs(librosa.stft(y, n_fft=n_fft, hop_length=hop))
+        freqs   = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+        # Energia media per bin di frequenza
+        mean_spec = np.mean(S, axis=1)
+
+        # ── 1. Cut-off frequency ──────────────────────────────────────────────
+        # I codec lossy applicano un lowpass; cerchiamo dove l'energia crolla
+        mean_db = 20 * np.log10(mean_spec + 1e-12)
+        # Normalizza rispetto al picco nella banda 1-5kHz
+        ref_band = (freqs >= 1000) & (freqs <= 5000)
+        if np.any(ref_band):
+            ref_db = np.max(mean_db[ref_band])
+        else:
+            ref_db = np.max(mean_db)
+
+        # Cerca il punto da cui l'energia scende stabilmente sotto -40dB rispetto ref
+        cutoff_hz = None
+        high_band = freqs > 8000
+        if np.any(high_band):
+            high_db  = mean_db[high_band]
+            high_f   = freqs[high_band]
+            for i in range(len(high_db)-10, 0, -1):
+                window_db = high_db[max(0,i-5):i+5]
+                if np.mean(window_db) > ref_db - 40:
+                    cutoff_hz = float(high_f[i])
+                    break
+
+        result["cutoff_freq_hz"] = round(cutoff_hz, 1) if cutoff_hz else None
+
+        # Anomalia: cut-off < sr/2 * 0.85 (atteso che vada fino a Nyquist)
+        nyquist = sr / 2
+        if cutoff_hz and cutoff_hz < nyquist * 0.85:
+            result["cutoff_anomaly"] = True
+            result["spectral_notches"].append({
+                "freq_hz": round(cutoff_hz, 1),
+                "tipo":    "LOWPASS CUTOFF",
+                "desc":    f"Energia dimezzata a {cutoff_hz:.0f}Hz (Nyquist={nyquist:.0f}Hz)"
+            })
+
+        # ── 2. Notches periodici (firma MDCT doppia codifica) ────────────────
+        # MP3 usa blocchi MDCT da 576 campioni → periodicità spettrali a multipli
+        # di sr/576 nell'asse temporale dello spettrogramma
+        S_var = np.var(S, axis=1)  # varianza temporale per bin
+        if len(S_var) > 20:
+            # Cerca dip nella varianza (punti di energia costante = artefatti lossy)
+            var_norm = S_var / (np.max(S_var) + 1e-12)
+            dip_thresh = 0.05
+            dip_idx = np.where(
+                (var_norm < dip_thresh) &
+                (freqs[:len(var_norm)] > 1000) &
+                (freqs[:len(var_norm)] < nyquist * 0.9)
+            )[0]
+            if len(dip_idx) > 10:
+                # Raggruppa in cluster di frequenza
+                clusters = []
+                if len(dip_idx) > 0:
+                    cluster_start = dip_idx[0]
+                    for i in range(1, len(dip_idx)):
+                        if dip_idx[i] - dip_idx[i-1] > 5:
+                            f_center = freqs[int(np.mean([cluster_start, dip_idx[i-1]]))]
+                            clusters.append(round(float(f_center), 1))
+                            cluster_start = dip_idx[i]
+                    f_center = freqs[int(np.mean([cluster_start, dip_idx[-1]]))]
+                    clusters.append(round(float(f_center), 1))
+
+                if len(clusters) >= 3:
+                    result["spectral_notches"].extend([
+                        {"freq_hz": f, "tipo": "MDCT DIP",
+                         "desc": "Varianza temporale nulla (artefatto lossy)"}
+                        for f in clusters[:5]
+                    ])
+
+        # ── 3. Periodicità MDCT temporale ────────────────────────────────────
+        # MP3: frame = 1152 campioni → modulazione a 1152/sr Hz
+        # OGG Vorbis: blocchi 256/2048 campioni
+        # Analizziamo autocorrelazione dell'energia per finestre
+        frame_energy = np.sum(S**2, axis=0)
+        if len(frame_energy) > 64:
+            # Autocorrelazione normalizzata
+            fe_norm = frame_energy - np.mean(frame_energy)
+            if np.std(fe_norm) > 0:
+                autocorr = np.correlate(fe_norm, fe_norm, mode='full')
+                autocorr = autocorr[len(autocorr)//2:]
+                autocorr /= (autocorr[0] + 1e-12)
+                # Cerca picchi di autocorrelazione (escluso lag 0)
+                search = autocorr[2:min(200, len(autocorr))]
+                if len(search) > 10:
+                    peak_lags = []
+                    for i in range(1, len(search)-1):
+                        if search[i] > search[i-1] and search[i] > search[i+1] and search[i] > 0.3:
+                            # Converti lag in campioni audio
+                            lag_samples = (i+2) * hop
+                            # MP3: 1152, OGG: 256 o 2048
+                            for frame_size, codec in [(1152,"MP3"),(2048,"OGG-large"),(256,"OGG-small")]:
+                                if abs(lag_samples - frame_size) < frame_size * 0.1:
+                                    peak_lags.append({"codec": codec,
+                                                      "lag_samples": lag_samples,
+                                                      "correlation": round(float(search[i]), 3)})
+                    if peak_lags:
+                        result["mdct_periodicity"] = peak_lags[0]
+
+        # ── Scoring finale ────────────────────────────────────────────────────
+        score = 0
+        if result["cutoff_anomaly"]:      score += 3
+        if len(result["spectral_notches"]) >= 3: score += 2
+        if result["mdct_periodicity"]:    score += 3
+
+        if score >= 6:
+            result["double_enc_suspected"] = True
+            result["confidence"]           = "ALTA"
+        elif score >= 3:
+            result["double_enc_suspected"] = True
+            result["confidence"]           = "MEDIA"
+        else:
+            result["confidence"]           = "BASSA"
+
+        if ext not in (".mp3", ".ogg", ".oga", ".m4a", ".wma", ".aac"):
+            result["note"] = "File non compresso: doppia codifica improbabile ma verifica utile"
+
+    except Exception as e:
+        result["note"] = f"Errore analisi double encoding: {e}"
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ▶ NUOVO v4.0 — INTER-SAMPLE DEPENDENCY / RESAMPLING DETECTION (§5.4.4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detect_resampling(y, sr):
+    """
+    Rileva tracce di ricampionamento digitale tramite periodicità nelle
+    dipendenze inter-campione (residui di predizione lineare).
+    Il ricampionamento per fattore P/Q introduce correlazioni periodiche
+    ogni Q campioni nel residuo LP.
+    Riferimento: ENFSI BPM-FSA-002 §5.4.4, Vázquez-Padín [67][68].
+
+    Metodo:
+    1. Calcola residuo di predizione lineare (ordine 2)
+    2. Calcola l'autocorrelazione del residuo al quadrato
+    3. Cerca picchi periodici nell'autocorrelazione (lag 2-100)
+    4. Identifica il fattore di ricampionamento più probabile
+    """
+    result = {
+        "resampling_detected":  False,
+        "period_samples":       None,
+        "period_time_ms":       None,
+        "estimated_ratio":      None,
+        "original_sr_estimate": None,
+        "confidence":           "BASSA",
+        "autocorr_peak":        None,
+        "note":                 "",
+    }
+
+    if len(y) < sr * 2:
+        result["note"] = "File troppo breve (<2s) per analisi resampling"
+        return result
+
+    try:
+        # Usa un segmento rappresentativo (max 30s dal centro)
+        center = len(y) // 2
+        seg_len = min(int(sr * 30), len(y))
+        start   = max(0, center - seg_len // 2)
+        seg     = y[start:start + seg_len].astype(np.float64)
+
+        # ── 1. Residuo di predizione lineare ordine 2 ─────────────────────────
+        # res[n] = y[n] - a1*y[n-1] - a2*y[n-2]
+        # Stima coefficienti via autocorrelazione (metodo Yule-Walker semplificato)
+        r0 = np.dot(seg, seg)
+        r1 = np.dot(seg[1:], seg[:-1])
+        r2 = np.dot(seg[2:], seg[:-2])
+        if r0 > 0:
+            # Solve 2x2 system [r0 r1; r1 r0] [a1; a2] = [r1; r2]
+            denom = r0**2 - r1**2
+            if abs(denom) > 1e-10:
+                a1 = (r1*r0 - r2*r1) / denom
+                a2 = (r2*r0 - r1**2) / denom
+            else:
+                a1, a2 = 0.0, 0.0
+        else:
+            a1, a2 = 0.0, 0.0
+
+        residual = seg[2:] - a1*seg[1:-1] - a2*seg[:-2]
+
+        # ── 2. Autocorrelazione del residuo al quadrato ───────────────────────
+        res_sq   = residual**2
+        res_norm = res_sq - np.mean(res_sq)
+        max_lag  = min(200, len(res_norm) // 4)
+        if max_lag < 10:
+            result["note"] = "Segmento troppo breve per autocorrelazione"
+            return result
+
+        # Calcola autocorrelazione per lag 2..max_lag
+        autocorr = np.array([
+            float(np.dot(res_norm[:len(res_norm)-lag], res_norm[lag:]))
+            for lag in range(2, max_lag + 1)
+        ])
+        # Normalizza
+        norm_val = autocorr[0] if abs(autocorr[0]) > 1e-15 else 1.0
+        autocorr /= norm_val
+
+        # ── 3. Ricerca picchi nell'autocorrelazione ───────────────────────────
+        best_lag   = None
+        best_corr  = 0.0
+        threshold  = 0.08  # soglia conservativa
+
+        for i in range(1, len(autocorr) - 1):
+            val = autocorr[i]
+            if (val > autocorr[i-1] and val > autocorr[i+1] and val > threshold):
+                if val > best_corr:
+                    best_corr = val
+                    best_lag  = i + 2  # +2 perché partiamo da lag=2
+
+        if best_lag is not None:
+            result["resampling_detected"] = True
+            result["period_samples"]      = best_lag
+            result["period_time_ms"]      = round(1000 * best_lag / sr, 4)
+            result["autocorr_peak"]       = round(best_corr, 4)
+
+            # ── 4. Stima del fattore P/Q di ricampionamento ───────────────────
+            # Rapporti comuni: 44100→48000 (P/Q=160/147),
+            # 22050→44100 (2/1), 48000→44100 (147/160), etc.
+            COMMON_RATIOS = [
+                (160, 147, 44100, 48000),  # 44100→48000
+                (147, 160, 48000, 44100),  # 48000→44100
+                (2,   1,   22050, 44100),  # 22050→44100
+                (1,   2,   44100, 22050),  # 44100→22050
+                (3,   2,   32000, 48000),  # 32000→48000
+                (4,   3,   24000, 32000),  # 24000→32000
+                (80,  441, 44100, 8000),   # 44100→8000
+                (6,   5,   40000, 48000),  # 40000→48000
+            ]
+            best_match = None
+            for P, Q, from_sr, to_sr in COMMON_RATIOS:
+                if abs(best_lag - Q) <= max(1, int(Q * 0.05)):
+                    best_match = {"P": P, "Q": Q,
+                                  "from_sr": from_sr, "to_sr": to_sr,
+                                  "ratio": f"{P}/{Q}"}
+                    break
+
+            if best_match:
+                result["estimated_ratio"]      = best_match["ratio"]
+                result["original_sr_estimate"] = best_match["from_sr"]
+                result["note"] = (f"Ricampionamento stimato {best_match['from_sr']}Hz"
+                                  f" → {best_match['to_sr']}Hz (P/Q={best_match['ratio']})")
+            else:
+                result["note"] = f"Periodo={best_lag} campioni non corrisponde a ratio noti"
+
+            if best_corr >= 0.20:   result["confidence"] = "ALTA"
+            elif best_corr >= 0.10: result["confidence"] = "MEDIA"
+
+    except Exception as e:
+        result["note"] = f"Errore analisi resampling: {e}"
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ▶ NUOVO v4.0 — COPY-MOVE FORGERY DETECTION (ENFSI BPM §5.4.4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detect_copy_move(y, sr, segment_sec=1.0, top_matches=5):
+    """
+    Rilevamento di intervalli temporali identici (copy-paste) tramite
+    cross-correlazione di segmenti e confronto di fingerprint spettrali.
+    Riferimento: ENFSI BPM-FSA-002 §5.4.4, Imran [62], Maksimović [63].
+
+    Metodo:
+    1. Divide l'audio in segmenti sovrapposti di 1s
+    2. Estrae fingerprint spettrale compatto (MFCC 13 coefficienti)
+    3. Calcola distanza coseno tra tutti i coppie di segmenti
+    4. Segmenti con distanza < soglia = candidati copy-paste
+    5. Verifica tramite cross-correlazione diretta sulla forma d'onda
+    """
+    result = {
+        "segments_analyzed": 0,
+        "matches_found":     [],
+        "copy_move_suspected": False,
+        "max_similarity":    0.0,
+        "note":              "",
+    }
+
+    min_dur = segment_sec * 3
+    if len(y) / sr < min_dur:
+        result["note"] = f"File troppo breve (<{min_dur:.0f}s) per copy-move detection"
+        return result
+
+    try:
+        seg_len = int(sr * segment_sec)
+        hop     = seg_len // 2  # 50% overlap
+
+        # ── 1. Estrai fingerprint MFCC per ogni segmento ─────────────────────
+        segments  = []
+        seg_times = []
+        n_mfcc    = 13
+
+        i = 0
+        while i + seg_len <= len(y):
+            seg = y[i:i+seg_len]
+            # Fingerprint: MFCC mean + delta mean (26 features totali)
+            mfcc_vals = librosa.feature.mfcc(y=seg, sr=sr, n_mfcc=n_mfcc)
+            fp = np.concatenate([
+                np.mean(mfcc_vals, axis=1),
+                np.std(mfcc_vals,  axis=1),
+            ])
+            segments.append(fp)
+            seg_times.append(i / sr)
+            i += hop
+
+        n_segs = len(segments)
+        result["segments_analyzed"] = n_segs
+
+        if n_segs < 4:
+            result["note"] = "Troppo pochi segmenti per analisi"
+            return result
+
+        # ── 2. Matrice di similarità coseno ──────────────────────────────────
+        S = np.array(segments)
+        # Normalizza ogni vettore
+        norms = np.linalg.norm(S, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        S_norm = S / norms
+        # Matrice similarità (dot product di vettori normalizzati)
+        sim_matrix = np.dot(S_norm, S_norm.T)
+
+        # ── 3. Trova coppie simili ─────────────────────────────────────────────
+        COSINE_THRESHOLD = 0.985  # soglia alta: vuol dire >98.5% similarità
+        matches = []
+
+        for i in range(n_segs):
+            for j in range(i + 2, n_segs):  # gap minimo di 2 segmenti
+                sim = float(sim_matrix[i, j])
+                if sim >= COSINE_THRESHOLD:
+                    t1 = seg_times[i]
+                    t2 = seg_times[j]
+                    # Distanza minima: almeno 2s tra inizio segmenti
+                    if abs(t2 - t1) < 2.0:
+                        continue
+
+                    # ── 4. Verifica con cross-correlazione diretta ────────────
+                    seg_i = y[int(t1*sr):int(t1*sr)+seg_len]
+                    seg_j = y[int(t2*sr):int(t2*sr)+seg_len]
+                    if len(seg_i) == seg_len and len(seg_j) == seg_len:
+                        # Correlazione normalizzata
+                        n_i = np.linalg.norm(seg_i)
+                        n_j = np.linalg.norm(seg_j)
+                        if n_i > 0 and n_j > 0:
+                            xcorr = np.correlate(seg_i/n_i, seg_j/n_j, mode='full')
+                            xcorr_peak = float(np.max(np.abs(xcorr)))
+                        else:
+                            xcorr_peak = 0.0
+                    else:
+                        xcorr_peak = sim  # fallback
+
+                    matches.append({
+                        "t1_sec":     round(t1, 3),
+                        "t1_fmt":     format_dur(t1),
+                        "t2_sec":     round(t2, 3),
+                        "t2_fmt":     format_dur(t2),
+                        "cosine_sim": round(sim, 5),
+                        "xcorr_peak": round(xcorr_peak, 4),
+                        "gap_sec":    round(abs(t2-t1), 2),
+                    })
+
+        # Ordina per similarità decrescente, mantieni top N
+        matches.sort(key=lambda x: x["cosine_sim"], reverse=True)
+        matches = matches[:top_matches]
+
+        result["matches_found"]       = matches
+        result["copy_move_suspected"] = len(matches) > 0
+        result["max_similarity"]      = matches[0]["cosine_sim"] if matches else 0.0
+
+        if matches:
+            best = matches[0]
+            result["note"] = (
+                f"{len(matches)} coppia/e sospette. "
+                f"Massima similarità {best['cosine_sim']:.4f} "
+                f"tra t={best['t1_fmt']} e t={best['t2_fmt']}"
+            )
+
+    except Exception as e:
+        result["note"] = f"Errore copy-move detection: {e}"
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ANALISI ANOMALIE (aggiornata v4.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detect_anomalies(y, sr, wf, enf, dc_local, butt, quant,
+                     codec_frames=None, double_enc=None,
+                     resampling=None, copy_move=None):
+    """
+    Rileva anomalie forensi integrando tutti i moduli v4.0.
     Riferimenti ENFSI: §5.1.3 (principio fondamentale), §5.4.1-5.4.4.
     """
     anoms = []
@@ -576,7 +1193,7 @@ def detect_anomalies(y, sr, wf, enf, dc_local, butt, quant):
             "forense":"Problema hardware microfonico o editing",
             "ref":"§5.4.2 BPM-FSA-002, Koenig [20]"})
 
-    # ── 3. DC Offset locale (NUOVO v3.0) ─────────────────────────────────────
+    # ── 3. DC Offset locale ───────────────────────────────────────────────────
     if dc_local and dc_local.get("anomalies"):
         for a in dc_local["anomalies"]:
             anoms.append({"tipo":"DC OFFSET LOCALE","severità":"ALTA",
@@ -591,22 +1208,24 @@ def detect_anomalies(y, sr, wf, enf, dc_local, butt, quant):
         frames=librosa.util.frame(y,frame_length=fl,hop_length=hl)
         is_sil=np.sqrt(np.mean(frames**2,axis=0))<thr
         in_s=False; st=0
-        silence_runs=[]
         for i,s in enumerate(is_sil):
             if s and not in_s: in_s=True; st=i
             elif not s and in_s:
                 in_s=False
                 d=((i-st)*hl)/sr
-                if d>=SILENCE_MIN_SEC: silence_runs.append((st*hl/sr,d))
+                if d>=SILENCE_MIN_SEC:
+                    anoms.append({"tipo":"SILENZIO ANOMALO",
+                        "severità":"MEDIA" if d>3 else "BASSA",
+                        "dettaglio":f"{d:.2f}s @ t={format_dur(st*hl/sr)}",
+                        "forense":"Taglio/cancellazione/pausa non documentata",
+                        "ref":"§5.4.1 BPM-FSA-002"})
         if in_s:
             d=((len(is_sil)-st)*hl)/sr
-            if d>=SILENCE_MIN_SEC: silence_runs.append((st*hl/sr,d))
-        for t_start, dur in silence_runs:
-            anoms.append({"tipo":"SILENZIO ANOMALO",
-                "severità":"MEDIA" if dur>3 else "BASSA",
-                "dettaglio":f"{dur:.2f}s @ t={format_dur(t_start)}",
-                "forense":"Taglio/cancellazione/pausa non documentata",
-                "ref":"§5.4.1 BPM-FSA-002"})
+            if d>=SILENCE_MIN_SEC:
+                anoms.append({"tipo":"SILENZIO ANOMALO","severità":"BASSA",
+                    "dettaglio":f"{d:.2f}s @ t={format_dur(st*hl/sr)}",
+                    "forense":"Taglio/cancellazione/pausa non documentata",
+                    "ref":"§5.4.1 BPM-FSA-002"})
 
     # ── 5. Discontinuità ampiezza (grossolana) ────────────────────────────────
     bs=int(sr*0.5)
@@ -620,16 +1239,16 @@ def detect_anomalies(y, sr, wf, enf, dc_local, butt, quant):
                     "forense":"Sospetto punto di splice/editing",
                     "ref":"§5.4.2 BPM-FSA-002"})
 
-    # ── 6. Butt-splice PCM (NUOVO v3.0, Cooper method) ────────────────────────
+    # ── 6. Butt-splice PCM ───────────────────────────────────────────────────
     if butt and butt.get("splices"):
-        for sp in butt["splices"][:10]:  # max 10 segnalazioni
+        for sp in butt["splices"][:10]:
             anoms.append({"tipo":"BUTT-SPLICE PCM","severità":"ALTA",
                 "dettaglio":f"Taglio netto @ t={sp['timestamp_fmt']} "
                             f"(ratio={sp['ratio']:.1f}σ)",
                 "forense":"Taglio diretto tra campioni PCM — forte indice di editing",
                 "ref":"§5.4.2 BPM-FSA-002, Cooper [23]"})
 
-    # ── 7. ENF — discontinuità di fase (NUOVO v3.0) ───────────────────────────
+    # ── 7. ENF discontinuità ─────────────────────────────────────────────────
     if enf and enf.get("enf_present") and enf.get("phase_jumps", 0) > 0:
         for ts in enf["jump_timestamps"][:5]:
             anoms.append({"tipo":"ENF DISCONTINUITÀ","severità":"ALTA",
@@ -645,10 +1264,10 @@ def detect_anomalies(y, sr, wf, enf, dc_local, butt, quant):
             "forense":"Registrazione da rete elettrica diversa o file manipolato",
             "ref":"§5.4.1 BPM-FSA-002, Grigoras [53]"})
 
-    # ── 8. Quantizzazione (NUOVO v3.0) ────────────────────────────────────────
+    # ── 8. Quantizzazione ────────────────────────────────────────────────────
     if quant and quant.get("suspected_gain"):
         anoms.append({"tipo":"GAIN DIGITALE SOSPETTO","severità":"MEDIA",
-            "dettaglio":f"Gap periodici nel'istogramma (periodo={quant['periodic_gap']})",
+            "dettaglio":f"Gap periodici nell'istogramma (periodo={quant['periodic_gap']})",
             "forense":"Possibile modifica del guadagno digitale post-registrazione",
             "ref":"§5.4.4 BPM-FSA-002, Grigoras [24]"})
 
@@ -660,12 +1279,79 @@ def detect_anomalies(y, sr, wf, enf, dc_local, butt, quant):
             "forense":"ADC con risoluzione inferiore al dichiarato",
             "ref":"§5.4.5 BPM-FSA-002, Grigoras [24]"})
 
-    # ── 9. Kurtosis ───────────────────────────────────────────────────────────
+    # ── 9. Kurtosis ──────────────────────────────────────────────────────────
     if wf["kurtosis"] > 10:
         anoms.append({"tipo":"KURTOSIS ELEVATA","severità":"BASSA",
             "dettaglio":f"k={wf['kurtosis']} (atteso 0-6 per audio naturale)",
             "forense":"Impulsi/click o manipolazione del segnale",
             "ref":"§5.2 BPM-FSA-002"})
+
+    # ── 10. ▶ NUOVO v4.0 — Codec frame OGG ──────────────────────────────────
+    if codec_frames and codec_frames.get("applicable"):
+        for gj in codec_frames.get("granule_jumps", [])[:5]:
+            anoms.append({"tipo":"OGG GRANULE ANOMALY","severità":"ALTA",
+                "dettaglio":f"Granule {gj['tipo']} @ {gj['offset_hex']} "
+                            f"(Δ={gj['delta']})",
+                "forense":"Discontinuità nel timestamp interno OGG — editing sospetto",
+                "ref":"§5.4.3 BPM-FSA-002, Gärtner [33], Korycki [34]"})
+        for sg in codec_frames.get("seq_gaps", [])[:5]:
+            anoms.append({"tipo":"OGG SEQUENCE GAP","severità":"ALTA",
+                "dettaglio":f"Seq gap @ {sg['offset_hex']} "
+                            f"(atteso={sg['expected']}, trovato={sg['found']})",
+                "forense":"Gap nella sequenza pagine OGG — pagine mancanti o inserite",
+                "ref":"§5.4.3 BPM-FSA-002, Yang [35]"})
+        if codec_frames.get("framing_ok") == False and \
+           not codec_frames.get("granule_jumps") and not codec_frames.get("seq_gaps"):
+            anoms.append({"tipo":"OGG FRAMING ANOMALY","severità":"MEDIA",
+                "dettaglio":"Struttura OGG non conforme attesa",
+                "forense":"Possibile manipolazione della struttura del file",
+                "ref":"§5.4.3 BPM-FSA-002"})
+
+    # ── 11. ▶ NUOVO v4.0 — Double encoding ───────────────────────────────────
+    if double_enc and double_enc.get("double_enc_suspected"):
+        conf = double_enc.get("confidence","BASSA")
+        sev  = "ALTA" if conf=="ALTA" else "MEDIA"
+        detail = f"Confidenza {conf}"
+        if double_enc.get("cutoff_freq_hz"):
+            detail += f" | cutoff={double_enc['cutoff_freq_hz']}Hz"
+        if double_enc.get("mdct_periodicity"):
+            mp = double_enc["mdct_periodicity"]
+            detail += f" | MDCT match {mp.get('codec','?')}"
+        anoms.append({"tipo":"DOPPIA CODIFICA LOSSY","severità":sev,
+            "dettaglio":detail,
+            "forense":"File ricompresso dopo editing — mascheramento delle tracce",
+            "ref":"§5.4.4 BPM-FSA-002, Bianchi [69], Korycki [71]"})
+
+    if double_enc and double_enc.get("cutoff_anomaly"):
+        hz = double_enc.get("cutoff_freq_hz","?")
+        anoms.append({"tipo":"CUTOFF FREQUENZA ANOMALO","severità":"MEDIA",
+            "dettaglio":f"Energia cade a {hz}Hz (atteso fino a Nyquist)",
+            "forense":"Lowpass codec applicato — indicatore di codifica lossy",
+            "ref":"§5.4.2-5.4.4 BPM-FSA-002"})
+
+    # ── 12. ▶ NUOVO v4.0 — Resampling ────────────────────────────────────────
+    if resampling and resampling.get("resampling_detected"):
+        conf = resampling.get("confidence","BASSA")
+        sev  = "ALTA" if conf=="ALTA" else "MEDIA"
+        detail = (f"Periodo={resampling['period_samples']} campioni "
+                  f"({resampling['period_time_ms']}ms)")
+        if resampling.get("estimated_ratio"):
+            detail += f" | ratio stimato {resampling['estimated_ratio']}"
+        if resampling.get("original_sr_estimate"):
+            detail += f" | SR originale ~{resampling['original_sr_estimate']}Hz"
+        anoms.append({"tipo":"RESAMPLING RILEVATO","severità":sev,
+            "dettaglio":detail,
+            "forense":"Ricampionamento digitale post-registrazione — traccia di post-processing",
+            "ref":"§5.4.4 BPM-FSA-002, Vázquez-Padín [67][68]"})
+
+    # ── 13. ▶ NUOVO v4.0 — Copy-move ─────────────────────────────────────────
+    if copy_move and copy_move.get("copy_move_suspected"):
+        for match in copy_move.get("matches_found", [])[:3]:
+            anoms.append({"tipo":"COPY-MOVE SOSPETTO","severità":"ALTA",
+                "dettaglio":f"Segmento simile @ t={match['t1_fmt']} ≈ t={match['t2_fmt']} "
+                            f"(sim={match['cosine_sim']:.4f}, xcorr={match['xcorr_peak']:.3f})",
+                "forense":"Intervalli temporali quasi identici — copia/incolla sospetta",
+                "ref":"§5.4.4 BPM-FSA-002, Imran [62], Maksimović [63]"})
 
     return anoms
 
@@ -686,7 +1372,9 @@ def spectral_features(y, sr):
     except Exception as e: return {"error":str(e)}
 
 
-def integrity_verdict(anoms, fmt, ext, enf, butt, dc_local, quant):
+def integrity_verdict(anoms, fmt, ext, enf, butt, dc_local, quant,
+                      codec_frames=None, double_enc=None,
+                      resampling=None, copy_move=None):
     """Calcola verdetto integrità con scoring ENFSI-aligned."""
     score = 100; flags = []
     sev_map = {"ALTA":20, "MEDIA":10, "BASSA":5}
@@ -1023,6 +1711,87 @@ def generate_html_report(data, plot_path, out_path):
         flags_html += "".join(f'<span class="flag">{f}</span>' for f in iv["flags"])
         flags_html += "</div></div>"
 
+    # ── Codec Frames HTML ────────────────────────────────────────────────────
+    cf   = data.get("codec_frames", {})
+    cf_html = ""
+    if cf and cf.get("applicable"):
+        framing_ok = cf.get("framing_ok")
+        badge = '✓ OK' if framing_ok else ('⚠ ANOMALIE' if framing_ok==False else '—')
+        badge_col = '#30d158' if framing_ok else ('#ff453a' if framing_ok==False else '#888')
+        cf_html = f"""
+        <div class="card"><div class="ctitle">🎵 OGG Codec Frames (§5.4.3)</div>
+        <div class="cbody"><table>
+          {row("Framing status",f'<span style="color:{badge_col}">{badge}</span>')}
+          {row("Pagine totali",str(cf.get('total_pages',0)))}
+          {row("Serial streams",str(cf.get('serial_streams',[])))}
+          {row("Granule jumps",str(len(cf.get('granule_jumps',[]))))}
+          {row("Sequence gaps",str(len(cf.get('seq_gaps',[]))))}
+          {row("Page size anomalies",str(len(cf.get('page_size_anomalies',[]))))}
+        </table>"""
+        for gj in cf.get("granule_jumps",[])[:4]:
+            cf_html += f'<div style="font-size:11px;color:#ff453a;padding:2px 0">⚑ Granule {gj["tipo"]} @ {gj["offset_hex"]} (Δ={gj["delta"]})</div>'
+        for sg in cf.get("seq_gaps",[])[:4]:
+            cf_html += f'<div style="font-size:11px;color:#ff453a;padding:2px 0">⚑ Seq gap @ {sg["offset_hex"]} (atteso={sg["expected"]}, trovato={sg["found"]})</div>'
+        cf_html += "</div></div>"
+
+    # ── Double Encoding HTML ─────────────────────────────────────────────────
+    de   = data.get("double_enc", {})
+    de_html = ""
+    if de:
+        de_suspected = de.get("double_enc_suspected", False)
+        de_col = '#ff453a' if de_suspected else '#30d158'
+        de_html = f"""
+        <div class="card"><div class="ctitle">🔁 Double Encoding (§5.4.4)</div>
+        <div class="cbody"><table>
+          {row("Doppia codifica sospetta",f'<span style="color:{de_col}">{"⚠ SÌ" if de_suspected else "✓ No"}</span>')}
+          {row("Confidenza",de.get('confidence','—'))}
+          {row("Cutoff frequenza",f"{de.get('cutoff_freq_hz','N/A')} Hz")}
+          {row("Cutoff anomalo","⚠ SÌ" if de.get('cutoff_anomaly') else "✓ No")}
+          {row("MDCT periodicità",str(de.get('mdct_periodicity','—')))}
+          {row("Note",de.get('note','—'))}
+        </table></div></div>"""
+
+    # ── Resampling HTML ──────────────────────────────────────────────────────
+    rs   = data.get("resampling", {})
+    rs_html = ""
+    if rs:
+        rs_det = rs.get("resampling_detected", False)
+        rs_col = '#ff453a' if rs_det else '#30d158'
+        rs_html = f"""
+        <div class="card"><div class="ctitle">🔀 Resampling (§5.4.4)</div>
+        <div class="cbody"><table>
+          {row("Resampling rilevato",f'<span style="color:{rs_col}">{"⚠ SÌ" if rs_det else "✓ No"}</span>')}
+          {row("Confidenza",rs.get('confidence','—'))}
+          {row("Periodo (campioni)",str(rs.get('period_samples','—')))}
+          {row("Periodo (ms)",str(rs.get('period_time_ms','—')))}
+          {row("Ratio stimato P/Q",rs.get('estimated_ratio','—'))}
+          {row("SR originale stimato",f"{rs.get('original_sr_estimate','—')} Hz" if rs.get('original_sr_estimate') else '—')}
+          {row("Picco autocorr.",str(rs.get('autocorr_peak','—')))}
+          {row("Note",rs.get('note','—'))}
+        </table></div></div>"""
+
+    # ── Copy-Move HTML ───────────────────────────────────────────────────────
+    cm   = data.get("copy_move", {})
+    cm_html = ""
+    if cm:
+        cm_det = cm.get("copy_move_suspected", False)
+        cm_col = '#ff453a' if cm_det else '#30d158'
+        cm_html = f"""
+        <div class="card"><div class="ctitle">📋 Copy-Move (§5.4.4)</div>
+        <div class="cbody">
+          <p style="color:{cm_col};font-weight:700;margin-bottom:8px">
+            {"⚠ " + str(len(cm.get("matches_found",[]))) + " coppie sospette" if cm_det else "✓ Nessun copy-paste rilevato"}
+          </p><table>
+          {row("Segmenti analizzati",str(cm.get('segments_analyzed','—')))}
+          {row("Similarità massima",str(cm.get('max_similarity','—')))}
+        </table>"""
+        for m in cm.get("matches_found",[])[:5]:
+            cm_html += (f'<div style="font-size:11px;color:#ff9f0a;padding:3px 0">'
+                        f'⚑ t={m["t1_fmt"]} ≈ t={m["t2_fmt"]} | sim={m["cosine_sim"]:.4f}'
+                        f'</div>')
+        cm_html += f'<div style="font-size:10px;color:#636366;margin-top:4px">{cm.get("note","")}</div>'
+        cm_html += "</div></div>"
+
     html = f"""<!DOCTYPE html><html lang="it"><head><meta charset="UTF-8">
 <title>Report Forense — {fi['filename']}</title>
 <style>
@@ -1111,6 +1880,10 @@ img{{width:100%;border-radius:4px}}
     {butt_html}
     {dcl_html}
     {quant_html}
+    {cf_html}
+    {de_html}
+    {rs_html}
+    {cm_html}
     <div class="card"><div class="ctitle">📡 Spettrale</div>
       <div class="cbody"><table>{spec_rows}</table></div></div>
     <div class="card"><div class="ctitle">🏷 Metadati (§5.4.4)</div>
@@ -1202,43 +1975,92 @@ def run_analysis(filepath, out_dir, progress_cb, log_cb, enf_nominal=ENF_NOMINAL
     log_cb(f"  Quantizzazione: {quant['used_levels']}/{quant['total_levels']} livelli "
            f"| gain sospetto: {'SÌ' if quant.get('suspected_gain') else 'No'}",
            "warn" if quant.get("suspected_gain") else "ok")
-    progress_cb(80, "Analisi spettrale + LTAS...")
+    progress_cb(78, "Codec frame analysis (§5.4.3)...")
 
+    codec_frames = {}
+    if ext.lower() in (".ogg", ".oga", ".opus"):
+        codec_frames = analyze_codec_frames_ogg(filepath)
+        n_gj = len(codec_frames.get("granule_jumps", []))
+        n_sq = len(codec_frames.get("seq_gaps", []))
+        log_cb(f"  OGG frames: {codec_frames.get('total_pages',0)} pagine | "
+               f"granule jumps={n_gj} | seq gaps={n_sq}",
+               "warn" if (n_gj+n_sq)>0 else "ok")
+    else:
+        log_cb("  Codec frame analysis OGG: non applicabile (formato non OGG)", "info")
+    progress_cb(83, "Double encoding detection (§5.4.4)...")
+
+    double_enc = detect_double_encoding(y, sr, filepath)
+    if double_enc.get("double_enc_suspected"):
+        log_cb(f"  Double encoding: SOSPETTO (confidenza={double_enc['confidence']}) "
+               f"| cutoff={double_enc.get('cutoff_freq_hz','?')}Hz", "warn")
+    else:
+        log_cb(f"  Double encoding: non rilevato", "ok")
+    progress_cb(87, "Resampling detection (§5.4.4)...")
+
+    resampling = detect_resampling(y, sr)
+    if resampling.get("resampling_detected"):
+        log_cb(f"  Resampling: RILEVATO (T={resampling['period_samples']} campioni, "
+               f"confidenza={resampling['confidence']}) | {resampling.get('note','')}",
+               "warn")
+    else:
+        log_cb(f"  Resampling: non rilevato", "ok")
+    progress_cb(91, "Copy-move forgery detection (§5.4.4)...")
+
+    copy_move = detect_copy_move(y, sr)
+    if copy_move.get("copy_move_suspected"):
+        log_cb(f"  Copy-move: {len(copy_move['matches_found'])} coppie sospette | "
+               f"max sim={copy_move['max_similarity']:.4f}", "warn")
+    else:
+        log_cb(f"  Copy-move: nessun segmento duplicato rilevato", "ok")
+
+    progress_cb(94, "Analisi spettrale + LTAS...")
     sp   = spectral_features(y, sr)
     ltas = compute_ltas(y, sr)
     log_cb(f"  Centroide spettrale: {sp.get('centroid_mean_hz','N/A')} Hz", "info")
-    progress_cb(87, "Rilevamento anomalie integrate...")
+    progress_cb(96, "Rilevamento anomalie integrate (v4.0)...")
 
-    anoms = detect_anomalies(y, sr, wf, enf, dc_local, butt, quant)
+    anoms = detect_anomalies(y, sr, wf, enf, dc_local, butt, quant,
+                             codec_frames=codec_frames,
+                             double_enc=double_enc,
+                             resampling=resampling,
+                             copy_move=copy_move)
     log_cb(f"  Anomalie totali: {len(anoms)}", "warn" if anoms else "ok")
     for a in anoms:
         col = {"ALTA":"err","MEDIA":"warn","BASSA":"info"}.get(a["severità"],"info")
         log_cb(f"    ⚑ [{a['severità']}] {a['tipo']}: {a['dettaglio']}", col)
-    progress_cb(92, "Grafici...")
+    progress_cb(97, "Grafici...")
 
     fig = generate_plots_fig(y, sr, enf_data=enf, butt_data=butt)
     plot_path = save_plots_png(fig, out_dir, bn)
     log_cb(f"  Grafici: {os.path.basename(plot_path)}", "info")
-    progress_cb(96, "Report HTML...")
+    progress_cb(99, "Report HTML...")
 
     iv = integrity_verdict(anoms, fi["format_detected"], ext,
-                           enf, butt, dc_local, quant)
+                           enf, butt, dc_local, quant,
+                           codec_frames=codec_frames,
+                           double_enc=double_enc,
+                           resampling=resampling,
+                           copy_move=copy_move)
     data = {
-        "file_info":   fi,
-        "hashes":      hashes,
-        "metadata":    meta,
-        "ogg_info":    ogg_info,
-        "waveform":    wf,
-        "enf":         enf,
-        "butt_splice": butt,
-        "dc_local":    dc_local,
-        "quantization":quant,
-        "ltas":        ltas,
-        "anomalies":   anoms,
-        "spectral":    sp,
-        "integrity":   iv,
-        "bpm_ref":     BPM_REF,
-        "analysis_ts": datetime.datetime.now().isoformat(),
+        "file_info":    fi,
+        "hashes":       hashes,
+        "metadata":     meta,
+        "ogg_info":     ogg_info,
+        "waveform":     wf,
+        "enf":          enf,
+        "butt_splice":  butt,
+        "dc_local":     dc_local,
+        "quantization": quant,
+        "codec_frames": codec_frames,
+        "double_enc":   double_enc,
+        "resampling":   resampling,
+        "copy_move":    copy_move,
+        "ltas":         ltas,
+        "anomalies":    anoms,
+        "spectral":     sp,
+        "integrity":    iv,
+        "bpm_ref":      BPM_REF,
+        "analysis_ts":  datetime.datetime.now().isoformat(),
     }
 
     report_path = os.path.join(out_dir, f"{bn}_report.html")
@@ -1479,6 +2301,7 @@ class AudioForensicsApp(Tk):
         self.tab_summary = self._make_summary_tab()
         self.tab_charts  = self._make_charts_tab()
         self.tab_enf     = self._make_enf_tab()
+        self.tab_advanced= self._make_advanced_tab()
         self.tab_details = self._make_details_tab()
         self.tab_hash    = self._make_hash_tab()
 
@@ -1645,6 +2468,83 @@ class AudioForensicsApp(Tk):
         self.dc_tree.pack(fill="both",expand=True,side="left")
         ttk.Scrollbar(dcf,orient="vertical",
                       command=self.dc_tree.yview).pack(side="right",fill="y")
+        return f
+
+    # ── TAB ADVANCED v4.0 ─────────────────────────────────────────────────────
+    def _make_advanced_tab(self):
+        f = Frame(self.nb, bg=C["bg"])
+        self.nb.add(f, text="  Analisi Avanzata  ")
+
+        # ── OGG Codec frames ──────────────────────────────────────────────────
+        cf_f = Frame(f, bg=C["panel"]); cf_f.pack(fill="x", padx=12, pady=(12,6))
+        Label(cf_f, text="OGG CODEC FRAME ANALYSIS — §5.4.3 (Gärtner [33], Korycki [34], Yang [35])",
+              font=("Segoe UI",8,"bold"), bg=C["panel"], fg=C["accent"], padx=10).pack(anchor="w", pady=(8,2))
+        Label(cf_f, text="Granule position monotonicamente crescente · Sequence number consecutivo · Page size anomalie",
+              font=("Segoe UI",8), bg=C["panel"], fg=C["text2"], padx=10).pack(anchor="w", pady=(0,4))
+        self.cf_tree = ttk.Treeview(cf_f, columns=("param","valore"), show="headings", height=5)
+        self.cf_tree.heading("param",  text="Parametro")
+        self.cf_tree.heading("valore", text="Valore")
+        self.cf_tree.column("param",  width=220, stretch=False)
+        self.cf_tree.column("valore", width=400, stretch=True)
+        self.cf_tree.pack(fill="x", padx=0, pady=(0,4))
+
+        self.cf_anom_tree = ttk.Treeview(cf_f,
+            columns=("tipo","serial","offset","detail"), show="headings", height=4)
+        self.cf_anom_tree.heading("tipo",   text="Tipo")
+        self.cf_anom_tree.heading("serial", text="Serial")
+        self.cf_anom_tree.heading("offset", text="Offset hex")
+        self.cf_anom_tree.heading("detail", text="Dettaglio")
+        for col, w in [("tipo",100),("serial",80),("offset",100),("detail",280)]:
+            self.cf_anom_tree.column(col, width=w, stretch=(col=="detail"))
+        self.cf_anom_tree.pack(fill="x", padx=0, pady=(0,8))
+        self.cf_anom_tree.tag_configure("jump", foreground=C["danger"])
+        self.cf_anom_tree.tag_configure("gap",  foreground=C["warn"])
+
+        # ── Double encoding ───────────────────────────────────────────────────
+        de_f = Frame(f, bg=C["panel2"]); de_f.pack(fill="x", padx=12, pady=(0,6))
+        Label(de_f, text="DOUBLE ENCODING DETECTION — §5.4.4 (Bianchi [69], Korycki [71])",
+              font=("Segoe UI",8,"bold"), bg=C["panel2"], fg=C["accent"], padx=10).pack(anchor="w", pady=(8,2))
+        Label(de_f, text="Cutoff frequency · MDCT periodicità · Notches spettrali",
+              font=("Segoe UI",8), bg=C["panel2"], fg=C["text2"], padx=10).pack(anchor="w", pady=(0,4))
+        self.de_tree = ttk.Treeview(de_f, columns=("param","valore"), show="headings", height=5)
+        self.de_tree.heading("param",  text="Parametro")
+        self.de_tree.heading("valore", text="Valore")
+        self.de_tree.column("param",  width=220, stretch=False)
+        self.de_tree.column("valore", width=400, stretch=True)
+        self.de_tree.pack(fill="x", padx=0, pady=(0,8))
+
+        # ── Resampling ────────────────────────────────────────────────────────
+        rs_f = Frame(f, bg=C["panel"]); rs_f.pack(fill="x", padx=12, pady=(0,6))
+        Label(rs_f, text="RESAMPLING DETECTION — §5.4.4 (Vázquez-Padín [67][68])",
+              font=("Segoe UI",8,"bold"), bg=C["panel"], fg=C["accent"], padx=10).pack(anchor="w", pady=(8,2))
+        Label(rs_f, text="Autocorrelazione residuo LP · Periodicità inter-sample · Stima ratio P/Q",
+              font=("Segoe UI",8), bg=C["panel"], fg=C["text2"], padx=10).pack(anchor="w", pady=(0,4))
+        self.rs_tree = ttk.Treeview(rs_f, columns=("param","valore"), show="headings", height=6)
+        self.rs_tree.heading("param",  text="Parametro")
+        self.rs_tree.heading("valore", text="Valore")
+        self.rs_tree.column("param",  width=220, stretch=False)
+        self.rs_tree.column("valore", width=400, stretch=True)
+        self.rs_tree.pack(fill="x", padx=0, pady=(0,8))
+
+        # ── Copy-Move ─────────────────────────────────────────────────────────
+        cm_f = Frame(f, bg=C["panel2"]); cm_f.pack(fill="both", expand=True, padx=12, pady=(0,8))
+        Label(cm_f, text="COPY-MOVE FORGERY DETECTION — §5.4.4 (Imran [62], Maksimović [63])",
+              font=("Segoe UI",8,"bold"), bg=C["panel2"], fg=C["accent"], padx=10).pack(anchor="w", pady=(8,2))
+        Label(cm_f, text="MFCC fingerprint · Similarità coseno · Cross-correlazione waveform",
+              font=("Segoe UI",8), bg=C["panel2"], fg=C["text2"], padx=10).pack(anchor="w", pady=(0,4))
+        self.cm_tree = ttk.Treeview(cm_f,
+            columns=("t1","t2","sim","xcorr","gap"), show="headings", height=6)
+        self.cm_tree.heading("t1",    text="Segmento 1")
+        self.cm_tree.heading("t2",    text="Segmento 2")
+        self.cm_tree.heading("sim",   text="Similarità")
+        self.cm_tree.heading("xcorr", text="XCorr")
+        self.cm_tree.heading("gap",   text="Gap (s)")
+        for col, w in [("t1",100),("t2",100),("sim",90),("xcorr",80),("gap",70)]:
+            self.cm_tree.column(col, width=w, stretch=(col=="t1"))
+        self.cm_tree.pack(fill="both", expand=True, side="left")
+        ttk.Scrollbar(cm_f, orient="vertical",
+                      command=self.cm_tree.yview).pack(side="right", fill="y")
+        self.cm_tree.tag_configure("match", foreground=C["danger"])
         return f
 
     # ── TAB DETTAGLI ──────────────────────────────────────────────────────────
@@ -1954,6 +2854,84 @@ class AudioForensicsApp(Tk):
         if not dc_l.get("anomalies"):
             self.dc_tree.insert("","end",values=("—","✓ Nessuna anomalia DC locale","",""))
 
+        # ── Tab Advanced (v4.0) ───────────────────────────────────────────────
+        # OGG Codec frames
+        for i in self.cf_tree.get_children(): self.cf_tree.delete(i)
+        for i in self.cf_anom_tree.get_children(): self.cf_anom_tree.delete(i)
+        cf = data.get("codec_frames", {})
+        if cf and cf.get("applicable"):
+            framing_str = "✓ OK" if cf.get("framing_ok") else "⚠ ANOMALIE" if cf.get("framing_ok")==False else "—"
+            for k, v in [
+                ("Applicabile", "✓ Sì"),
+                ("Framing status", framing_str),
+                ("Pagine totali", str(cf.get("total_pages", 0))),
+                ("Serial streams", str(cf.get("serial_streams", []))),
+                ("Granule jumps", str(len(cf.get("granule_jumps", [])))),
+                ("Sequence gaps", str(len(cf.get("seq_gaps", [])))),
+                ("Page size anomalie", str(len(cf.get("page_size_anomalies", [])))),
+                ("Note", cf.get("note", "—") or "—"),
+            ]:
+                self.cf_tree.insert("","end", values=(k, v))
+            for gj in cf.get("granule_jumps", []):
+                self.cf_anom_tree.insert("","end",
+                    values=(f"GRANULE {gj['tipo']}", gj.get("serial",""), gj.get("offset_hex",""), f"Δ={gj['delta']}"),
+                    tags=("jump",))
+            for sg in cf.get("seq_gaps", []):
+                self.cf_anom_tree.insert("","end",
+                    values=("SEQ GAP", sg.get("serial",""), sg.get("offset_hex",""), f"atteso={sg['expected']} trovato={sg['found']}"),
+                    tags=("gap",))
+        else:
+            self.cf_tree.insert("","end", values=("Applicabile", "✗ Non OGG — non applicabile"))
+
+        # Double encoding
+        for i in self.de_tree.get_children(): self.de_tree.delete(i)
+        de = data.get("double_enc", {})
+        if de:
+            de_sus = de.get("double_enc_suspected", False)
+            for k, v in [
+                ("Doppia codifica sospetta", "⚠ SÌ" if de_sus else "✓ No"),
+                ("Confidenza", de.get("confidence","—")),
+                ("Cutoff frequenza (Hz)", str(de.get("cutoff_freq_hz","N/A"))),
+                ("Cutoff anomalo", "⚠ SÌ" if de.get("cutoff_anomaly") else "✓ No"),
+                ("Notches spettrali", str(len(de.get("spectral_notches",[])))),
+                ("MDCT periodicità", str(de.get("mdct_periodicity","—"))),
+                ("Note", de.get("note","—") or "—"),
+            ]:
+                self.de_tree.insert("","end", values=(k, v))
+
+        # Resampling
+        for i in self.rs_tree.get_children(): self.rs_tree.delete(i)
+        rs = data.get("resampling", {})
+        if rs:
+            rs_det = rs.get("resampling_detected", False)
+            for k, v in [
+                ("Resampling rilevato", "⚠ SÌ" if rs_det else "✓ No"),
+                ("Confidenza", rs.get("confidence","—")),
+                ("Periodo (campioni)", str(rs.get("period_samples","—"))),
+                ("Periodo (ms)", str(rs.get("period_time_ms","—"))),
+                ("Ratio stimato P/Q", rs.get("estimated_ratio","—") or "—"),
+                ("SR originale stimato", f"{rs.get('original_sr_estimate','—')} Hz" if rs.get("original_sr_estimate") else "—"),
+                ("Picco autocorrelazione", str(rs.get("autocorr_peak","—"))),
+                ("Note", rs.get("note","—") or "—"),
+            ]:
+                self.rs_tree.insert("","end", values=(k, v))
+
+        # Copy-Move
+        for i in self.cm_tree.get_children(): self.cm_tree.delete(i)
+        cm = data.get("copy_move", {})
+        if cm:
+            matches = cm.get("matches_found", [])
+            if matches:
+                for m in matches:
+                    self.cm_tree.insert("","end",
+                        values=(m["t1_fmt"], m["t2_fmt"],
+                                f"{m['cosine_sim']:.4f}", f"{m['xcorr_peak']:.3f}",
+                                f"{m['gap_sec']:.1f}"),
+                        tags=("match",))
+            else:
+                self.cm_tree.insert("","end",
+                    values=("✓ Nessun match","","","",""))
+
         # ── Tab Dettagli ──────────────────────────────────────────────────────
         for i in self.detail_tree.get_children(): self.detail_tree.delete(i)
         sections = [
@@ -2082,20 +3060,24 @@ class AudioForensicsApp(Tk):
         refs = (
             "ENFSI BPM-FSA-002 — Best Practice Manual for Digital Audio Authenticity Analysis\n"
             "SWGDE — Best Practices for Digital Audio Authentication v1.2\n\n"
-            "Metodi implementati:\n"
+            "Metodi implementati in v4.0:\n"
             "  §5.4.1  ENF Analysis (Grigoras [47], Michałek [51])\n"
             "  §5.4.2  Butt-splice detection (Cooper [23])\n"
             "  §5.4.2  DC Offset locale (Koenig [20][21][22])\n"
+            "  §5.4.3  OGG Codec frame analysis (Gärtner [33], Korycki [34], Yang [35])\n"
+            "  §5.4.4  Double encoding detection (Bianchi [69], Korycki [71])\n"
+            "  §5.4.4  Resampling detection (Vázquez-Padín [67][68])\n"
+            "  §5.4.4  Copy-move forgery (Imran [62], Maksimović [63])\n"
             "  §5.4.4  Quantization level analysis (Grigoras [24][25])\n"
             "  §5.4.4  Metadata categorization (Michałek [12])\n"
             "  §5.4.5  LTAS/LTASS (Grigoras [24][28])\n"
             "  §8      Hash SHA-1/SHA-256/MD5\n"
         )
-        messagebox.showinfo("Riferimenti ENFSI BPM-FSA-002",refs)
+        messagebox.showinfo("Riferimenti ENFSI BPM-FSA-002 v4.0", refs)
 
     def show_about(self):
         win=tk.Toplevel(self); win.title("Informazioni")
-        win.geometry("480x320"); win.resizable(False,False)
+        win.geometry("500x360"); win.resizable(False,False)
         win.configure(bg=C["panel"]); win.transient(self); win.grab_set()
         Label(win,text="⚖ Audio Forensics Analyzer",
               font=("Segoe UI",14,"bold"),bg=C["panel"],fg=C["accent"]).pack(pady=(20,4))
@@ -2103,8 +3085,9 @@ class AudioForensicsApp(Tk):
               font=("Segoe UI",9),bg=C["panel"],fg=C["text2"]).pack()
         ttk.Separator(win,orient="horizontal").pack(fill="x",padx=20,pady=14)
         for lbl,val in [
-            ("Nuovo v3.0","ENF Analysis · Butt-splice PCM · DC Offset locale"),
-            ("","Quantization analysis · LTAS · Metadati categorizzati"),
+            ("Nuovo v4.0","OGG frame analysis · Double encoding · Resampling detection"),
+            ("","Copy-move forgery · 13 moduli ENFSI totali"),
+            ("v3.0","ENF Analysis · Butt-splice · DC Offset locale · Quantizzazione"),
             ("Formati","WAV · MP3 · OGG · FLAC · AIFF · M4A · WMA · OPUS"),
             ("Framework","Python · librosa · soundfile · mutagen · scipy"),
             ("Standard","ENFSI BPM-FSA-002 / SWGDE v1.2"),
