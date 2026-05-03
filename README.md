@@ -19,6 +19,7 @@
 - [Compilazione in EXE distribuibile](#compilazione-in-exe-distribuibile)
 - [Risoluzione problemi](#risoluzione-problemi)
 - [Struttura del progetto](#struttura-del-progetto)
+- [Roadmap](#roadmap)
 
 ---
 
@@ -295,3 +296,87 @@ Leggasi sezione LICENSE
 ---
 
 *Progetto sviluppato per uso forense professionale. L'autore non si assume responsabilita per utilizzi impropri del software o per interpretazioni errate dei risultati prodotti.*
+
+
+---
+
+## Roadmap
+
+Questa sezione documenta le future implementazioni pianificate per il progetto, organizzate per fasi di sviluppo.
+
+---
+
+### Fase 2 — Robustezza e Qualità (breve termine)
+
+**v1.1 — Stabilità e compatibilità**
+
+- Supporto ricorsivo alle cartelle (attualmente la ricerca è non ricorsiva)
+- - Supporto nativo MP3 senza FFmpeg obbligatorio tramite `pydub` con fallback automatico
+  - - Gestione errori più granulare con messaggi localizzati in italiano
+    - - Progress bar per singolo file oltre che per il batch complessivo
+      - - Test automatizzati (unittest/pytest) su campioni audio sintetici
+        - - Aggiunta file `.spec` PyInstaller pre-configurato nel repository
+         
+          - **v1.2 — Estensione formati**
+         
+          - - Supporto WebM/Ogg con traccia Opus
+            - - Supporto AAC nativo senza passare da contenitore M4A
+              - - Supporto WMA (forense su materiale Windows legacy)
+                - - Supporto AMR (telefonia, intercettazioni)
+                 
+                  - ---
+
+                  ### Fase 3 — Analisi Forense Avanzata (medio termine)
+
+                  **v2.0 — Motore di analisi potenziato**
+
+                  - **Rilevamento steganografia audio**: analisi LSB (Least Significant Bit) per individuare payload nascosti in file WAV/FLAC
+                  - - **Analisi ENF (Electric Network Frequency)**: confronto della frequenza di rete (50/60 Hz) registrata ambientalmente per geolocalizzare o datare una registrazione
+                    - - **Rilevamento voce sintetica / deepfake audio**: integrazione con modelli leggeri (ONNX) per distinguere voce umana da TTS o voice cloning
+                      - - **Speaker diarization**: identificazione automatica dei turni di parola e del numero di speaker distinti nel file
+                        - - **Analisi doppia compressione (double compression)**: rilevamento di file MP3 ricodificati (artifact ghosting), indizio di manomissione
+                          - - **Confronto inter-file**: rilevamento di sovrapposizioni, copie parziali o rielaborazioni dello stesso contenuto originale
+                           
+                            - **v2.1 — Report e Chain of Custody**
+                           
+                            - - Generazione report in formato **PDF firmato digitalmente** (reportlab + firma PKCS#7)
+                              - - Log immutabile con timestamp certificato tramite TSA (Time Stamping Authority)
+                                - - Sezione "note del perito" editabile nell'applicazione prima dell'export
+                                  - - Supporto export in formato **DFXML** (Digital Forensics XML) per interoperabilità con Autopsy e FTK
+                                   
+                                    - ---
+
+                                    ### Fase 4 — Architettura e Distribuzione (lungo termine)
+
+                                    **v3.0 — Refactoring architetturale**
+
+                                    - Separazione netta tra engine forense (`core/`) e GUI (`ui/`) per uso headless
+                                    - - Modalità **CLI** completa: `audio_forensics --input file.wav --output ./report --format json,html,pdf`
+                                      - - Plugin system per moduli di analisi esterni senza modificare il core
+                                        - - Configurazione tramite file YAML/JSON (soglie anomalie, parametri analisi, formato output)
+                                          - - Database SQLite locale per storico delle analisi e ricerca per hash
+                                           
+                                            - **v3.1 — Interfaccia e UX**
+                                           
+                                            - - Migrazione GUI da Tkinter a **CustomTkinter** o **PyQt6** per un look più moderno
+                                              - - Tema chiaro/scuro selezionabile dall'utente
+                                                - - Visualizzatore audio integrato con player e zoom interattivo sulla forma d'onda
+                                                  - - Timeline interattiva con evidenziazione grafica delle anomalie (click su anomalia → zoom sul segnale)
+                                                    - - Localizzazione multilingua (IT/EN come minimo)
+                                                     
+                                                      - **v3.2 — Integrazione ed ecosistema**
+                                                     
+                                                      - - Packaging come installatore Windows (Inno Setup) con upgrade automatico
+                                                        - - Integrazione opzionale con **VirusTotal API** per cross-check dell'hash del file
+                                                          - - Integrazione con **Autopsy** come plugin (tramite Jython bridge)
+                                                            - - Versione web-app leggera (FastAPI + frontend) per uso in ambienti lab condivisi
+                                                              - - Supporto firma elettronica del perito tramite smart card (PKCS#11)
+                                                               
+                                                                - ---
+
+                                                                ### Priorità di sviluppo suggerita
+
+                                                                1. Test automatizzati e supporto ricorsivo cartelle (v1.1) — solidità senza riscrivere l'architettura
+                                                                2. 2. Analisi ENF e rilevamento doppia compressione MP3 (v2.0) — feature più richieste in ambito forense
+                                                                   3. 3. Modalità CLI e separazione core/GUI (v3.0) — apre il progetto a pipeline automatizzate
+                                                                      4. 4. Report PDF firmato e supporto DFXML (v2.1) — completano il profilo per uso peritale certificato
