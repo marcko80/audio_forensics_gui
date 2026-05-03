@@ -377,7 +377,11 @@ def generate_plots_fig(y,sr):
     ax5.set_xlabel("Ampiezza norm.",color=TC,fontsize=7)
     ax5.set_ylabel("Campioni",color=TC,fontsize=7)
 
-    fig.tight_layout(rect=[0,0,1,0.97])
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        fig.subplots_adjust(left=0.07, right=0.97, top=0.94, bottom=0.07,
+                            hspace=0.52, wspace=0.38)
     return fig
 
 def save_plots_png(fig, out_dir, basename):
