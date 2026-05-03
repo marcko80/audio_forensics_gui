@@ -290,7 +290,7 @@ audio_forensics_gui/
 
 ## Licenza
 
-Distribuito senza licenza esplicita. Consultare l'autore per informazioni sull'utilizzo in ambito commerciale o forense ufficiale.
+Leggasi sezione LICENSE
 
 ---
 
